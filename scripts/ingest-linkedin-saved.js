@@ -48,18 +48,26 @@ function extract(html) {
   };
   const ogTitle = meta('og:title'), ogDesc = meta('og:description'), ogImage = meta('og:image'), ogUrl = meta('og:url');
 
-  // Primary source: the page's JSON-LD SocialMediaPosting. Logged-out pages
-  // include it with the full articleBody, the poster as author.name, the
-  // publish date, and the visible comments. Verified 2026-09-08 against a live
-  // post; everything below it is fallback for pages that omit the block.
+  // Primary source: the page's JSON-LD block. Logged-out pages serve either a
+  // SocialMediaPosting (articleBody, author.name, comment[].author.name) or,
+  // for video posts, a VideoObject (description, creator.name,
+  // comment[].creator.name, optional transcript). Verified 2026-09-08 against
+  // live posts of both kinds; everything below is fallback for pages that
+  // omit the block.
   let ld = null;
   for (const m of html.matchAll(/<script type="application\/ld\+json">\s*([\s\S]*?)\s*<\/script>/g)) {
-    try { const d = JSON.parse(unescapeHtml(m[1])); if (d && d['@type'] === 'SocialMediaPosting') { ld = d; break; } } catch {}
+    try {
+      const d = JSON.parse(unescapeHtml(m[1]));
+      if (d && (d['@type'] === 'SocialMediaPosting' || d['@type'] === 'VideoObject')) { ld = d; break; }
+    } catch {}
   }
+  const isVideo = !!(ld && ld['@type'] === 'VideoObject');
 
-  // Post body: JSON-LD articleBody, then the attributed-text paragraph, then
-  // og:description with its trailing " | N comments on LinkedIn" removed.
-  let text = ld && ld.articleBody ? String(ld.articleBody).trim() : '';
+  // Post body: JSON-LD articleBody (SocialMediaPosting) or description
+  // (VideoObject; the caption field is short/empty, ignore it), then the
+  // attributed-text paragraph, then og:description with its trailing
+  // " | N comments on LinkedIn" removed.
+  let text = ld && (ld.articleBody || ld.description) ? String(ld.articleBody || ld.description).trim() : '';
   let completeness = 'full';
   if (!text) {
     const blocks = [...html.matchAll(/<p[^>]*attributed-text[^>]*>([\s\S]*?)<\/p>/g)].map(m => stripTags(m[1])).filter(Boolean);
@@ -67,25 +75,40 @@ function extract(html) {
   }
   if (!text) { text = ogDesc.replace(/\s*\|\s*\d+\s+comments?(\s+on\s+LinkedIn)?\s*$/i, '').trim(); completeness = text ? 'caption-only' : 'transcript-missing'; }
 
-  // Author: JSON-LD author.name. Fallback is the tail of og:title, which reads
+  // Author: JSON-LD author.name (SocialMediaPosting) or creator.name
+  // (VideoObject). Fallback is the tail of og:title, which reads
   // "<truncated post> | <Author> | N comments". Description tags carry no author.
-  let author = ld && ld.author && ld.author.name ? String(ld.author.name).trim() : '';
+  let author = ld && ld.author && ld.author.name ? String(ld.author.name).trim()
+    : ld && ld.creator && ld.creator.name ? String(ld.creator.name).trim()
+    : '';
   if (!author) author = (ogTitle.match(/\s\|\s([^|]+?)\s\|\s\d+\s+comments?\s*$/) || ogTitle.match(/\s\|\s([^|]+?)\s*$/) || [])[1] || 'unknown';
-  // Author URL: og:url is /posts/<author-slug>_<post-slug>-activity-<id>-<hash>
-  const slug = (ogUrl.match(/\/posts\/([A-Za-z0-9-]+?)_/) || [])[1] || '';
-  const authorUrl = slug ? `https://www.linkedin.com/in/${slug}` : '';
+
+  // Author URL: prefer JSON-LD creator.url / author.url when it points at a
+  // LinkedIn profile or company page, else fall back to the og:url shape
+  // /posts/<author-slug>_<post-slug>-activity-<id>-<hash>.
+  const ldAuthorUrl = (ld && ld.creator && ld.creator.url) || (ld && ld.author && ld.author.url) || '';
+  let authorUrl = /linkedin\.com\/(in|company)\//i.test(ldAuthorUrl) ? ldAuthorUrl : '';
+  if (!authorUrl) {
+    const slug = (ogUrl.match(/\/posts\/([A-Za-z0-9-]+?)_/) || [])[1] || '';
+    authorUrl = slug ? `https://www.linkedin.com/in/${slug}` : '';
+  }
 
   const posted = ld && ld.datePublished ? String(ld.datePublished).slice(0, 10) : '';
 
-  // Comments: JSON-LD carries the visible ones. Kept as the reliability signal
-  // the reels adapter uses; a comment section that contradicts a post is data.
+  // Comments: JSON-LD carries the visible ones, under author.name
+  // (SocialMediaPosting) or creator.name (VideoObject). Kept as the
+  // reliability signal the reels adapter uses; a comment section that
+  // contradicts a post is data.
   const comments = ld && Array.isArray(ld.comment)
-    ? ld.comment.map(c => ({ who: c.author && c.author.name ? String(c.author.name) : 'unknown', text: String(c.text || '').trim() })).filter(c => c.text)
+    ? ld.comment.map(c => ({ who: (c.author && c.author.name) || (c.creator && c.creator.name) || 'unknown', text: String(c.text || '').trim() })).filter(c => c.text)
     : [];
   const commentCount = ld && ld.commentCount != null ? Number(ld.commentCount) : null;
-  const reactions = ld && Array.isArray(ld.interactionStatistic)
-    ? (ld.interactionStatistic.find(x => /Like/i.test(String(x.interactionType || ''))) || {}).userInteractionCount ?? null
-    : null;
+  // interactionStatistic is an array on SocialMediaPosting, sometimes a bare
+  // object on VideoObject; normalize to an array before hunting for LikeAction.
+  const stats = ld && ld.interactionStatistic ? (Array.isArray(ld.interactionStatistic) ? ld.interactionStatistic : [ld.interactionStatistic]) : [];
+  const reactions = (stats.find(x => /Like/i.test(String(x.interactionType || ''))) || {}).userInteractionCount ?? null;
+
+  const transcript = isVideo && ld.transcript ? String(ld.transcript).trim() : '';
 
   // Media: a document/carousel viewer means slides this adapter did not read
   const isDoc = /document-viewer|native-document|ssplayer/i.test(html);
@@ -95,14 +118,20 @@ function extract(html) {
     .map(m => m[0])[0]) || '';
   let media = ogImage ? 'image' : 'text';
   if (isDoc) { media = 'document'; if (completeness === 'full') completeness = 'slides-unread'; }
+  if (isVideo) {
+    media = 'video';
+    // A video with only a caption/description and no transcript is incomplete,
+    // same rule the reels adapter uses.
+    if (!transcript) completeness = 'transcript-missing';
+  }
 
-  return { text, author, authorUrl, posted, ogImage, article, media, completeness, comments, commentCount, reactions };
+  return { text, author, authorUrl, posted, ogImage, article, media, completeness, comments, commentCount, reactions, transcript };
 }
 
 async function fetchOnce(url) {
   const r = await fetch(url, { headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.9' }, redirect: 'follow' });
   const html = await r.text();
-  return { status: r.status, html };
+  return { status: r.status, html, finalUrl: r.url };
 }
 
 (async () => {
@@ -119,6 +148,7 @@ async function fetchOnce(url) {
     try { res = await fetchOnce(url); if (res.status !== 200 || res.html.length < 5000) { await new Promise(r => setTimeout(r, PAUSE_MS)); res = await fetchOnce(url); } }
     catch (e) { gaps.push(`${id}  fetch-failed  ${e.message}`); continue; }
     if (res.status !== 200) { gaps.push(`${id}  http-${res.status}`); continue; }
+    if (/\/signup\/|\/login|\/authwall|\/checkpoint\//.test(res.finalUrl || '')) { gaps.push(`${id}  login-wall`); continue; }
 
     const x = extract(res.html);
     if (x.completeness !== 'full') gaps.push(`${id}  ${x.completeness.padEnd(19)} ${x.author}`);
@@ -148,6 +178,7 @@ async function fetchOnce(url) {
       x.text || '(no text captured)',
       '',
     ];
+    if (x.media === 'video' && x.transcript) head.push('## Transcript', x.transcript, '');
     if (x.article) head.push('## Linked', x.article, '');
     if (x.ogImage) head.push('## Image', x.ogImage, '');
     if (x.comments.length) {
