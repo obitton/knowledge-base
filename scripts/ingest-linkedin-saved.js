@@ -4,9 +4,10 @@
 // Input: a text file of post URLs, one per line (# comments allowed). Collect
 // them by hand from linkedin.com/my-items/saved-posts/; this script never
 // touches a logged-in session. Each URL is fetched once, unauthenticated, with
-// a pause between requests. LinkedIn serves the post body to logged-out
-// visitors; comments and reaction counts sit behind the sign-in wall and are
-// not captured, so this adapter has no "top comments" reliability signal.
+// a pause between requests. LinkedIn serves logged-out visitors a JSON-LD
+// SocialMediaPosting block with the full post, the author, the date, the
+// visible comments, and reaction counts, so records carry the same
+// top-comments reliability signal the reels adapter has.
 //
 //   node scripts/ingest-linkedin-saved.js [urls.txt]   (default C:/dev/linkedin-saved-urls.txt)
 //
@@ -45,41 +46,57 @@ function extract(html) {
            || html.match(new RegExp(`<meta[^>]+content="([^"]*)"[^>]+(?:property|name)="${p}"`, 'i'));
     return m ? unescapeHtml(m[1]) : '';
   };
-  const ogTitle = meta('og:title'), ogDesc = meta('og:description'), ogImage = meta('og:image');
+  const ogTitle = meta('og:title'), ogDesc = meta('og:description'), ogImage = meta('og:image'), ogUrl = meta('og:url');
 
-  // Post body: the attributed-text paragraph carries the full post; og:description is
-  // the fallback and may be truncated for long posts.
-  const blocks = [...html.matchAll(/<p[^>]*attributed-text[^>]*>([\s\S]*?)<\/p>/g)].map(m => stripTags(m[1])).filter(Boolean);
-  let text = blocks[0] || '';
-  let completeness = 'full';
-  if (!text) { text = ogDesc.split(' | ')[0].trim(); completeness = text ? 'caption-only' : 'transcript-missing'; }
-
-  // Author: logged-out pages put it at the tail of og:description as
-  // "...post | <Author> | N comments". The JSON-LD "author" entries are the
-  // commenters, not the poster, so they are deliberately not used.
-  const segs = ogDesc.split(' | ').map(t => t.trim());
-  let author = 'unknown';
-  if (segs.length >= 2) {
-    const last = segs[segs.length - 1];
-    const isCount = t => /^\d+\s+comments?(\s+on\s+LinkedIn)?$/i.test(t);
-    author = isCount(last) && segs.length >= 3 ? segs[segs.length - 2] : last;
+  // Primary source: the page's JSON-LD SocialMediaPosting. Logged-out pages
+  // include it with the full articleBody, the poster as author.name, the
+  // publish date, and the visible comments. Verified 2026-09-08 against a live
+  // post; everything below it is fallback for pages that omit the block.
+  let ld = null;
+  for (const m of html.matchAll(/<script type="application\/ld\+json">\s*([\s\S]*?)\s*<\/script>/g)) {
+    try { const d = JSON.parse(unescapeHtml(m[1])); if (d && d['@type'] === 'SocialMediaPosting') { ld = d; break; } } catch {}
   }
-  if (!author || /^\d+\s+comments?(\s+on\s+LinkedIn)?$/i.test(author)) author = (ogTitle.match(/^(.*?) on LinkedIn:/) || [])[1] || 'unknown';
-  const authorUrl = (html.match(/https:\/\/www\.linkedin\.com\/in\/[A-Za-z0-9_-]+/) || [])[0] || '';
 
-  // Date: JSON-LD when present, otherwise the relative "1mo" marker is all LinkedIn gives logged-out
-  const posted = (html.match(/"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
+  // Post body: JSON-LD articleBody, then the attributed-text paragraph, then
+  // og:description with its trailing " | N comments on LinkedIn" removed.
+  let text = ld && ld.articleBody ? String(ld.articleBody).trim() : '';
+  let completeness = 'full';
+  if (!text) {
+    const blocks = [...html.matchAll(/<p[^>]*attributed-text[^>]*>([\s\S]*?)<\/p>/g)].map(m => stripTags(m[1])).filter(Boolean);
+    text = blocks[0] || '';
+  }
+  if (!text) { text = ogDesc.replace(/\s*\|\s*\d+\s+comments?(\s+on\s+LinkedIn)?\s*$/i, '').trim(); completeness = text ? 'caption-only' : 'transcript-missing'; }
 
-  // Media: a document/carousel viewer or an article link means content this adapter did not read
-  const isDoc = /document-viewer|\.pdf|native-document|ssplayer/i.test(html);
-  // External link the post points at, ignoring LinkedIn's own hosts and its CDN
+  // Author: JSON-LD author.name. Fallback is the tail of og:title, which reads
+  // "<truncated post> | <Author> | N comments". Description tags carry no author.
+  let author = ld && ld.author && ld.author.name ? String(ld.author.name).trim() : '';
+  if (!author) author = (ogTitle.match(/\s\|\s([^|]+?)\s\|\s\d+\s+comments?\s*$/) || ogTitle.match(/\s\|\s([^|]+?)\s*$/) || [])[1] || 'unknown';
+  // Author URL: og:url is /posts/<author-slug>_<post-slug>-activity-<id>-<hash>
+  const slug = (ogUrl.match(/\/posts\/([A-Za-z0-9-]+?)_/) || [])[1] || '';
+  const authorUrl = slug ? `https://www.linkedin.com/in/${slug}` : '';
+
+  const posted = ld && ld.datePublished ? String(ld.datePublished).slice(0, 10) : '';
+
+  // Comments: JSON-LD carries the visible ones. Kept as the reliability signal
+  // the reels adapter uses; a comment section that contradicts a post is data.
+  const comments = ld && Array.isArray(ld.comment)
+    ? ld.comment.map(c => ({ who: c.author && c.author.name ? String(c.author.name) : 'unknown', text: String(c.text || '').trim() })).filter(c => c.text)
+    : [];
+  const commentCount = ld && ld.commentCount != null ? Number(ld.commentCount) : null;
+  const reactions = ld && Array.isArray(ld.interactionStatistic)
+    ? (ld.interactionStatistic.find(x => /Like/i.test(String(x.interactionType || ''))) || {}).userInteractionCount ?? null
+    : null;
+
+  // Media: a document/carousel viewer means slides this adapter did not read
+  const isDoc = /document-viewer|native-document|ssplayer/i.test(html);
+  // External link the post points at, ignoring LinkedIn's own hosts, its CDN, and boilerplate schema hosts
   const article = ([...html.matchAll(/https?:\/\/([a-z0-9.-]+)[^"'<>\s]*/gi)]
-    .filter(m => !/(^|\.)(linkedin\.com|licdn\.com|lnkd\.in)$/i.test(m[1]))
+    .filter(m => !/(^|\.)(linkedin\.com|licdn\.com|lnkd\.in|schema\.org|w3\.org)$/i.test(m[1]))
     .map(m => m[0])[0]) || '';
   let media = ogImage ? 'image' : 'text';
   if (isDoc) { media = 'document'; if (completeness === 'full') completeness = 'slides-unread'; }
 
-  return { text, author, authorUrl, posted, ogImage, article, media, completeness };
+  return { text, author, authorUrl, posted, ogImage, article, media, completeness, comments, commentCount, reactions };
 }
 
 async function fetchOnce(url) {
@@ -121,6 +138,8 @@ async function fetchOnce(url) {
       `content_type: ${yaml('')}`,
       `actionable: false`,
       `completeness: ${yaml(x.completeness)}`,
+      `reactions: ${x.reactions == null ? '' : x.reactions}`,
+      `comment_count: ${x.commentCount == null ? '' : x.commentCount}`,
       '---',
       '',
       `# ${x.author} — ${id}`,
@@ -131,7 +150,13 @@ async function fetchOnce(url) {
     ];
     if (x.article) head.push('## Linked', x.article, '');
     if (x.ogImage) head.push('## Image', x.ogImage, '');
-    head.push('## Comments', 'Not captured: LinkedIn shows comments and reactions only to signed-in visitors, and this adapter fetches logged out.', '');
+    if (x.comments.length) {
+      head.push('## Comments' + (x.commentCount != null ? ` (${x.comments.length} of ${x.commentCount} shown)` : ''));
+      for (const c of x.comments) head.push(`- **${c.who}:** ${c.text.replace(/\s*\n+\s*/g, ' ')}`);
+      head.push('');
+    } else {
+      head.push('## Comments', 'None visible on the logged-out page.', '');
+    }
     fs.writeFileSync(file, head.join('\n'));
     written++;
     console.log(`wrote ${id}  ${x.completeness}  ${x.author}`);
