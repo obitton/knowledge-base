@@ -48,9 +48,16 @@ by name.
 ## Rebuild
 
 ```bash
-node scripts/ingest-ig-reels.js   # source -> sources/ig-reels/*.md
-node scripts/build-index.js       # sources/ + notes/ -> kb.sqlite
+node scripts/ingest-ig-reels.js              # DM export -> sources/ig-reels/*.md
+node scripts/ingest-linkedin-saved.js urls.txt # hand-collected post URLs -> sources/linkedin-saved/*.md
+node scripts/build-index.js                  # sources/ + notes/ -> kb.sqlite
 ```
+
+The LinkedIn adapter fetches each URL once, logged out, with a pause between
+requests. It never touches a logged-in session; you collect the links yourself
+from your saved-posts page. Logged-out pages carry a JSON-LD block with the
+post, author, date, visible comments, and reaction count, and video posts often
+include a transcript. Posts behind a sign-up wall are reported, not written.
 
 `ingest` prints every record it could not fully populate, so gaps stay visible
 instead of quietly looking complete.
@@ -139,12 +146,19 @@ the same thing over your material.
 
 ## Current contents
 
-One source: `ig-reels` — 223 records distilled from an Instagram DM thread
+Two sources.
+
+`ig-reels`: 223 records distilled from an Instagram DM thread
 (2025-04-25 → 2026-09-07). 189 video transcripts via Whisper, 284 carousel and
 image slides read visually, plus captions and top comments for every post.
-Built by the pipeline in `C:\dev\ig-reels-corpus`.
+Built by the pipeline in `C:\dev\ig-reels-corpus`. Coverage is complete: 215
+records `full`, 8 `no-speech` (music-only videos whose caption carries the
+content), nothing missing.
 
-Coverage is complete: 215 records `full`, 8 `no-speech` (music-only videos whose
-caption carries the content), nothing missing. By category, the corpus is mostly
-AI/automation (72) and software engineering (28), then business and marketing
-(59).
+`linkedin-saved`: 35 records from saved LinkedIn posts (fetched 2026-09-08).
+Text posts and video posts with transcripts are `full`; 2 videos without a
+transcript on the page are `transcript-missing` and 2 document carousels are
+`slides-unread`. One saved post sits behind a sign-up wall and was skipped.
+
+By category the corpus is mostly AI/automation and software engineering, then
+business and marketing.
