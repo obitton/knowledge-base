@@ -1,0 +1,4 @@
+sources/
+kb.sqlite
+node_modules/
+*.log

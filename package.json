@@ -1,0 +1,13 @@
+{
+  "name": "knowledge-base",
+  "version": "1.0.0",
+  "description": "Local, citable knowledge base over saved content: FTS5 + local embeddings, RRF-fused, served to Claude and Codex over MCP. Zero runtime dependencies.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Ofir Bitton",
+  "license": "MIT",
+  "type": "commonjs"
+}
